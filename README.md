@@ -1,5 +1,12 @@
 # ComfyUI-ClipProj
 
+This fork adds a `vision_tokens` setting to ClipProj Apply and ClipProj Loader.
+`text_only (fast)` lets text attend to compact visual references and sends
+only the projected text rows to H3. `compact` keeps the compact visual rows
+and `full` retains the full visual input. The
+[optimized Timeline workflow](https://github.com/Lisadm/comfyui-obvpm-timeline)
+uses Fast with the v3.1 4B residual projection.
+
 **Swap a large text encoder for a small one, with a learned linear projection.**
 
 **Version 0.1.13 — required by the v3 matrices.** The `-v3-mlp` files carry no linear matrix, and any earlier version raises `KeyError: 'W'` when loading one.

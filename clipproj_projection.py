@@ -22,6 +22,7 @@ arbitrary code when opened, whereas safetensors cannot.
 
 import json
 import os
+import threading
 
 import torch
 from safetensors.torch import load_file as _load_safetensors
@@ -46,6 +47,31 @@ DEFAULT_COND_DIM = 5120
 CONTROLS = ["<control:zero>", "<control:identity>", "<control:random>"]
 
 _CACHE = {}
+
+_CPU_MLP_LOCK = threading.Lock()
+
+
+class CPUParallelResidual(torch.nn.Sequential):
+    """Use native CPU parallelism for fp16 projection, then restore the policy."""
+
+    def forward(self, x):
+        forward = super().forward
+        if x.device.type != "cpu" or x.dtype != torch.float16:
+            return forward(x)
+        # PyTorch's thread count is process-wide; serialize our scoped changes.
+        with _CPU_MLP_LOCK:
+            previous = torch.get_num_threads()
+            threads = min(16, os.cpu_count() or 1)
+            if previous < threads:
+                torch.set_num_threads(threads)
+            try:
+                # Bound the 32768-wide hidden activation without changing row math.
+                if x.ndim > 1 and x.shape[-2] > 256:
+                    return torch.cat([forward(part) for part in x.split(256, dim=-2)], dim=-2)
+                return forward(x)
+            finally:
+                if previous < threads:
+                    torch.set_num_threads(previous)
 
 
 def register_folder():
@@ -178,7 +204,7 @@ def build_residual(proj, device, dtype=None):
         modules.append(lin)
         if n < len(couches) - 1:
             modules.append(torch.nn.GELU())
-    reseau = torch.nn.Sequential(*modules).to(device=device, dtype=dtype)
+    reseau = CPUParallelResidual(*modules).to(device=device, dtype=dtype)
     # train(False) rather than the Module method it wraps, whose name collides
     # with the builtin a security scanner looks for. Identical behaviour, one
     # less false positive.

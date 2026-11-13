@@ -10,6 +10,8 @@ no special tokens, with vision blocks spliced in as
 model pair validated so far.
 """
 
+from contextlib import nullcontext
+from importlib.util import find_spec
 import json
 import logging
 import weakref
@@ -34,6 +36,8 @@ IM_START = 151644
 IM_END = 151645
 VISION_START = 151652
 VISION_END = 151653
+DEFAULT_VISION_MAX_PIXELS = 256 * 32 * 32
+VISION_TOKEN_MODES = ["text_only (fast)", "compact", "full"]
 
 
 def gpu_devices():
@@ -198,12 +202,25 @@ def install_video_blocks(sm):
         from comfy.text_encoders.minimax import process_video_block
     except Exception as e:
         logging.warning("[ClipProj] video blocks unavailable: %s", e)
-        return
+        process_video_block = None
+    try:
+        from comfy.text_encoders.qwen_vl import process_qwen2vl_images
+    except Exception:
+        process_qwen2vl_images = None
     original = tr.preprocess_embed
 
     def preprocess_embed(embed, device):
-        if embed.get("type") == "image" and embed.get("minimax_video_block", False):
-            flatten, grid = process_video_block(embed["data"])
+        max_pixels = embed.get("clipproj_max_pixels")
+        if embed.get("type") == "image" and embed.get("minimax_video_block", False) and process_video_block is not None:
+            kw = {"max_pixels": max_pixels} if max_pixels is not None else {}
+            flatten, grid = process_video_block(embed["data"], **kw)
+            merged, deepstack = tr.visual(flatten.to(device, dtype=torch.float32), grid)
+            return merged, {"grid": grid, "deepstack": deepstack}
+        if (embed.get("type") == "image" and max_pixels is not None
+                and process_qwen2vl_images is not None and hasattr(tr, "visual")):
+            flatten, grid = process_qwen2vl_images(
+                embed["data"], max_pixels=max_pixels, patch_size=16,
+                image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
             merged, deepstack = tr.visual(flatten.to(device, dtype=torch.float32), grid)
             return merged, {"grid": grid, "deepstack": deepstack}
         return original(embed, device)
@@ -323,11 +340,12 @@ def purge_projections(carte):
 class ProjectedCLIP:
     """A small encoder disguised as a large one, by linear projection."""
 
-    def __init__(self, base, projection_name):
+    def __init__(self, base, projection_name, vision_tokens="text_only (fast)"):
         self.__dict__["_base"] = base
         self.__dict__["_proj_name"] = projection_name
         self.__dict__["_proj"] = load_projection(projection_name)
         self.__dict__["_key"] = getattr(base.cond_stage_model, "clip", "qwen3vl_4b")
+        self.__dict__["_vision_tokens"] = vision_tokens
         # Device-side copy of the projection, made once.
         self.__dict__["_gpu"] = {}
         _enregistrer_projete(self)
@@ -344,7 +362,26 @@ class ProjectedCLIP:
 
     def clone(self):
         """Clone the wrapper by cloning the underlying CLIP."""
-        return ProjectedCLIP(self._base.clone(), self._proj_name)
+        return ProjectedCLIP(self._base.clone(), self._proj_name, self._vision_tokens)
+
+    def _effective_vision_mode(self):
+        env_mode = os.environ.get("CLIPPROJ_VISION_TOKENS", "").strip().lower()
+        if env_mode in ("full", "all", "0"):
+            return "full"
+        if env_mode in ("compact",):
+            return "compact"
+        if env_mode in ("text_only", "text_only (fast)", "fast", "1"):
+            return "text_only (fast)"
+        return self.__dict__.get("_vision_tokens", "text_only (fast)")
+
+    def _effective_vision_max_pixels(self):
+        mode = self._effective_vision_mode()
+        if mode == "full":
+            return None
+        try:
+            return int(os.environ.get("CLIPPROJ_VISION_MAX_PIXELS", str(DEFAULT_VISION_MAX_PIXELS)))
+        except ValueError:
+            return DEFAULT_VISION_MAX_PIXELS
 
     def tokenize(self, text, return_word_ids=False, images=[],
                  minimax_ref_items=None, **kwargs):
@@ -355,6 +392,7 @@ class ProjectedCLIP:
         """
         tok = _raw_tokenizer(self._base)
         entries = []
+        max_pixels = self._effective_vision_max_pixels()
 
         def add_text(s):
             entries.extend((t, 1.0) for t in tok(s, add_special_tokens=False)["input_ids"])
@@ -362,6 +400,8 @@ class ProjectedCLIP:
         def add_vision(data, video_block=False):
             entries.append((VISION_START, 1.0))
             embed = {"type": "image", "data": data, "original_type": "image"}
+            if max_pixels is not None:
+                embed["clipproj_max_pixels"] = max_pixels
             if video_block:
                 # Read back by preprocess_embed, which then routes the pair
                 # through process_video_block instead of the image path.
@@ -415,55 +455,7 @@ class ProjectedCLIP:
             entries = [t + (0,) for t in entries]
         return {self._key: [entries]}
 
-    def _encode(self, tokens):
-        """Read the chosen tap, then project.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: (cond [B, seq, d_out], tags [seq]).
-        """
-        proj = self._proj
-        base = self._base
-        sm = _submodel(base)
-        install_video_blocks(sm)
-        install_int8_vision_fix(sm)
-
-        mm.load_models_gpu([base.patcher])
-        device = base.patcher.load_device
-
-        pairs = tokens[self._key] if isinstance(tokens, dict) else tokens
-        pairs = [[(t[0], t[1]) for t in seq] for seq in pairs]
-
-        tap = int(proj["tap"])
-
-        # Tags depend on where the vision blocks sit, which only process_tokens
-        # knows. We intercept the forward call to capture it.
-        captured = {}
-        orig_forward = sm.transformer.forward
-
-        def capturing_forward(*args, **kwargs):
-            captured["embeds_info"] = kwargs.get("embeds_info", [])
-            return orig_forward(*args, **kwargs)
-
-        saved = (sm.layer, sm.layer_idx, sm.layer_norm_hidden_state, sm.execution_device)
-        try:
-            sm.transformer.forward = capturing_forward
-            sm.layer = [tap] if tap >= 0 else "last"
-            sm.layer_idx = None
-            sm.layer_norm_hidden_state = False
-            sm.execution_device = device
-            with mm.cuda_device_context(device):
-                with torch.no_grad():
-                    out = sm.encode_token_weights(pairs)
-        finally:
-            sm.transformer.forward = orig_forward
-            (sm.layer, sm.layer_idx, sm.layer_norm_hidden_state, sm.execution_device) = saved
-
-        h = out[0]
-        if h.dim() == 4:  # [B, n_taps, seq, d_in]: a single tap was requested
-            h = h[:, 0]
-        h = h.float()
-
-        dev = h.device
+    def _project_hidden_states(self, h, proj, dev):
         d_in = h.shape[-1]
         cache = self.__dict__["_gpu"]
         if cache.get("device") != dev:
@@ -473,14 +465,8 @@ class ProjectedCLIP:
             if "control" in proj:
                 cache["p"] = build_control(proj["control"], d_in, guess_cond_dim(), dev)
             else:
-                # mean_in plutot que W : les fichiers entraines sans chemin
-                # lineaire n'ont pas de W, et mean_in porte la meme dimension.
                 d_proj = proj["mean_in"].shape[0]
                 if d_in != d_proj:
-                    # Nommer les deux tailles ne suffit pas : la personne qui
-                    # tombe dessus a presque toujours telecharge une seule
-                    # matrice et branche un autre encodeur. Autant lui donner le
-                    # nom du fichier a prendre.
                     taille = {2560: "4B", 4096: "8B", 5120: "32B"}
                     raise ValueError(
                         "This projection does not go with this encoder. Your "
@@ -497,24 +483,23 @@ class ProjectedCLIP:
                               if k in proj}
                 cache["mlp"] = build_residual(proj, dev)
         p = cache["p"]
-
-        # Standardised space, where the ridge was fitted. The residual network,
-        # when the file carries one, corrects inside that same space so that it
-        # works at the scale of what it is correcting. Its last layer was
-        # trained from a zero initialisation, so a freshly trained network that
-        # learned nothing reproduces the matrix exactly.
-        xn = (h - p["mean_in"]) / p["std_in"]
+        h_dev = h.to(device=dev, dtype=torch.float32)
+        xn = (h_dev - p["mean_in"]) / p["std_in"]
         reseau = cache.get("mlp")
-        # Pas de W : le reseau a ete entraine sans chemin lineaire et porte tout.
-        # Le produit par une matrice de zeros donnerait le meme resultat pour un
-        # matmul 2560x5120 par token, et 26 Mo de zeros sur la carte.
         yn = xn @ p["W"] if "W" in p else None
         if reseau is not None:
-            # Le reseau reste dans le type du fichier ; on convertit
-            # autour de lui. Un residu fp16 tient alors en fp16 en VRAM,
-            # pas seulement sur le disque.
             td = reseau[0].weight.dtype
-            sortie = reseau(xn.to(td)).float()
+            x = xn.to(td)
+            if (self._effective_vision_mode() == "full" and dev.type == "cuda"
+                    and "W" not in p and find_spec("triton") is not None):
+                from . import clipproj_legacy_cuda
+                if clipproj_legacy_cuda.supports(reseau, x):
+                    sortie = clipproj_legacy_cuda.forward(reseau, x)
+                else:
+                    sortie = reseau(x)
+            else:
+                sortie = reseau(x)
+            sortie = sortie.float()
             yn = sortie if yn is None else yn + sortie
         elif yn is None:
             raise ValueError(
@@ -522,22 +507,109 @@ class ProjectedCLIP:
                 "network, so it cannot produce a conditioning. The file is "
                 "incomplete: download it again.")
         cond = yn * p["std_out"] + p["mean_out"]
-
-        # Token 0 is an attention sink: its direction is constant across prompts
-        # (cosine 1.0000 measured over 1966 of them) and carries no information
-        # from the text, yet its norm reaches 16 500 against 291 for a text
-        # token. Calibration excluded it — rightly, its extreme values would
-        # wreck the statistics — so W has never seen one and projects it to an
-        # arbitrary direction with a huge norm. That is invisible on a 200-token
-        # prompt where it is 0.5 % of the positions, and ruinous on a 7-token one
-        # where it is 14 %. Since the vector is constant, substituting its
-        # measured value is exact rather than approximate.
         sink = proj.get("sink_out")
         if sink is not None and cond.shape[1] > 0:
             cond[:, 0] = sink.to(device=cond.device, dtype=cond.dtype)
+        return cond.to(mm.intermediate_device())
 
-        cond = cond.to(mm.intermediate_device())
-        tags = tags_from_embeds_info(cond.shape[1], captured.get("embeds_info", []))
+    def _encode(self, tokens):
+        """Read the chosen tap, then project.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: (cond [B, seq, d_out], tags [seq]).
+        """
+        proj = self._proj
+        base = self._base
+        sm = _submodel(base)
+        install_video_blocks(sm)
+        install_int8_vision_fix(sm)
+
+        tap = int(proj["tap"])
+        tr_model = getattr(getattr(sm, "transformer", None), "model", None)
+        orig_layers = getattr(tr_model, "layers", None) if tr_model is not None else None
+        orig_norm = getattr(tr_model, "norm", None) if tr_model is not None else None
+        truncate_layers = (
+            orig_layers is not None
+            and isinstance(orig_layers, torch.nn.ModuleList)
+            and 0 < tap < len(orig_layers)
+        )
+
+        # Tags depend on where the vision blocks sit, which only process_tokens
+        # knows. We intercept the forward call to capture it.
+        captured = {}
+        orig_forward = sm.transformer.forward
+
+        def capturing_forward(*args, **kwargs):
+            captured["embeds_info"] = kwargs.get("embeds_info", [])
+            return orig_forward(*args, **kwargs)
+
+        saved = (sm.layer, sm.layer_idx, sm.layer_norm_hidden_state, sm.execution_device)
+        try:
+            if truncate_layers:
+                tr_model._modules["layers"] = orig_layers[:tap]
+                tr_model._modules["norm"] = None
+            mm.load_models_gpu([base.patcher])
+            device = base.patcher.load_device
+
+            pairs = tokens[self._key] if isinstance(tokens, dict) else tokens
+            pairs = [[(t[0], t[1]) for t in seq] for seq in pairs]
+
+            sm.transformer.forward = capturing_forward
+            sm.layer = [tap] if tap >= 0 else "last"
+            sm.layer_idx = None
+            sm.layer_norm_hidden_state = False
+            sm.execution_device = device
+            with mm.cuda_device_context(device):
+                with torch.no_grad():
+                    out = sm.encode_token_weights(pairs)
+        finally:
+            sm.transformer.forward = orig_forward
+            (sm.layer, sm.layer_idx, sm.layer_norm_hidden_state, sm.execution_device) = saved
+            if truncate_layers:
+                tr_model._modules["layers"] = orig_layers
+                tr_model._modules["norm"] = orig_norm
+
+        h = out[0]
+        if h.dim() == 4:  # [B, n_taps, seq, d_in]: a single tap was requested
+            h = h[:, 0]
+        h = h.float()
+
+        tags = tags_from_embeds_info(h.shape[1], captured.get("embeds_info", []))
+        if self._effective_vision_mode() == "text_only (fast)":
+            text_mask = tags == 1
+            if not bool(text_mask.all()) and bool(text_mask.any()):
+                text_idx = torch.nonzero(text_mask, as_tuple=False).squeeze(-1)
+                h = h.index_select(1, text_idx.to(h.device))
+                tags = torch.ones(h.shape[1], dtype=torch.long)
+
+        proj_dev = device if (isinstance(device, torch.device) and device.type != "cpu"
+                              and os.environ.get("CLIPPROJ_FORCE_CPU") != "1") else h.device
+        cache = self.__dict__["_gpu"]
+        try:
+            ctx = mm.cuda_device_context(proj_dev) if proj_dev.type == "cuda" else nullcontext()
+            try:
+                with ctx, torch.no_grad():
+                    cond = self._project_hidden_states(h, proj, proj_dev)
+            except RuntimeError as e:
+                if proj_dev.type == "cpu" or "out of memory" not in str(e).lower():
+                    raise
+                cache.clear()
+                mm.soft_empty_cache()
+                with torch.no_grad():
+                    cond = self._project_hidden_states(h, proj, torch.device("cpu"))
+        finally:
+            if proj_dev.type != "cpu" and os.environ.get("CLIPPROJ_KEEP_GPU_CACHE") != "1":
+                cache.clear()
+            if not getattr(base.patcher, "_clipproj_pinned", False) and hasattr(base.patcher, "_vbar_get"):
+                try:
+                    vbar = base.patcher._vbar_get()
+                    if vbar is not None:
+                        vbar.free_memory(8 * 1024 ** 3)
+                except Exception:
+                    pass
+            if proj_dev.type != "cpu":
+                mm.soft_empty_cache()
+
         return cond, tags
 
     def encode_from_tokens(self, tokens, return_pooled=False, return_dict=False):
@@ -569,23 +641,24 @@ class ProjectedCLIP:
         return self.encode_from_tokens(self.tokenize(text))
 
 
-def _wrap(clip, projection):
+def _wrap(clip, projection, vision_tokens="text_only (fast)"):
     """Wrap a CLIP and log which projection was selected.
 
     No check on the loaded model: any variant with a matching output dimension
     will do, quantised or fine-tuned included. If the dimensions disagree,
     encoding raises an explicit error.
     """
-    wrapped = ProjectedCLIP(clip, projection)
+    wrapped = ProjectedCLIP(clip, projection, vision_tokens=vision_tokens)
     p = wrapped._proj
     if "control" in p:
         logging.info("[ClipProj] control %s: a reference point, not a learned "
                      "projection", projection)
     else:
-        logging.info("[ClipProj] %s | tap %d | %d -> %d%s%s", projection,
+        logging.info("[ClipProj] %s | tap %d | %d -> %d%s%s | vision=%s", projection,
                      int(p["tap"]), p["mean_in"].shape[0], p["mean_out"].shape[0],
                      "" if "W" in p else " | residual only",
-                     " | cos_test %.4f" % float(p["cos_test"]) if "cos_test" in p else "")
+                     " | cos_test %.4f" % float(p["cos_test"]) if "cos_test" in p else "",
+                     vision_tokens)
     return wrapped
 
 
@@ -817,6 +890,11 @@ class ClipProjApply:
                 "projection": (list_projections(), {
                     "tooltip": "Learned matrix, or a <control:...> reference"}),
             },
+            "optional": {
+                "vision_tokens": (VISION_TOKEN_MODES, {
+                    "default": "text_only (fast)",
+                    "tooltip": "text_only (fast): text tokens attend to compact reference images in Qwen3-VL layers 0..tap, then only text tokens are projected to H3 cond (matching Molmo2 speed and keeping all projected tokens in-distribution). compact: keep compact vision tokens in cond. full: keep full-resolution vision tokens in cond."}),
+            },
         }
 
     RETURN_TYPES = ("CLIP",)
@@ -826,9 +904,9 @@ class ClipProjApply:
     DESCRIPTION = ("Insert the projection between an encoder and the diffusion "
                    "model's clip input.")
 
-    def apply(self, clip, projection):
+    def apply(self, clip, projection, vision_tokens="text_only (fast)"):
         """Return the projected version of the given CLIP."""
-        return (_wrap(clip, projection),)
+        return (_wrap(clip, projection, vision_tokens=vision_tokens),)
 
 
 class ClipProjLoader:
@@ -851,6 +929,11 @@ class ClipProjLoader:
                 "mode": (["resident", "streaming", "dynamic"],
                          {"default": "resident", "tooltip": MODE_TOOLTIP}),
             },
+            "optional": {
+                "vision_tokens": (VISION_TOKEN_MODES, {
+                    "default": "text_only (fast)",
+                    "tooltip": "text_only (fast): text tokens attend to compact reference images in Qwen3-VL layers 0..tap, then only text tokens are projected to H3 cond. compact: keep compact vision tokens in cond. full: keep full-resolution vision tokens in cond."}),
+            },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -859,10 +942,11 @@ class ClipProjLoader:
     CATEGORY = "ClipProj"
     DESCRIPTION = "Load a small text encoder and project it into the large one's space."
 
-    def load(self, clip_name, type, projection, device, mode="resident", unique_id=None):
+    def load(self, clip_name, type, projection, device, mode="resident",
+             vision_tokens="text_only (fast)", unique_id=None):
         """Load the encoder, then return its projected version."""
         clip = _load_encoder(clip_name, type, device, mode, unique_id)
-        return (_wrap(clip, projection),)
+        return (_wrap(clip, projection, vision_tokens=vision_tokens),)
 
 
 class AnyType(str):
